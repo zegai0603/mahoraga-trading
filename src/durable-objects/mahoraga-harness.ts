@@ -1938,12 +1938,13 @@ Response format:
     }
 
     try {
+      const isCrypto = symbol.includes("/");
       const order = await alpaca.trading.createOrder({
         symbol,
         notional: Math.round(positionSize * 100) / 100,
         side: "buy",
         type: "market",
-        time_in_force: "day",
+        time_in_force: isCrypto ? "ioc" : "day",
       });
 
       this.log("Executor", "buy_executed", { symbol, status: order.status, size: positionSize });
