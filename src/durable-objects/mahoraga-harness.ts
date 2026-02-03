@@ -103,6 +103,9 @@ interface AgentConfig {
   crypto_take_profit_pct: number;
   crypto_stop_loss_pct: number;
 
+  // Telegram status push - periodic status updates to Telegram
+  telegram_push_interval_hours: number; // [TUNE] 0 = disabled, otherwise hours between pushes
+
   // Custom ticker blacklist - user-defined symbols to never trade (e.g., insider trading restrictions)
   ticker_blacklist: string[];
 }
@@ -214,6 +217,7 @@ interface AgentState {
   twitterDailyReads: number;
   twitterDailyReadReset: number;
   premarketPlan: PremarketPlan | null;
+  lastTelegramPush: number;
   enabled: boolean;
 }
 
@@ -297,6 +301,7 @@ const DEFAULT_CONFIG: AgentConfig = {
   crypto_max_position_value: 1000,
   crypto_take_profit_pct: 10,
   crypto_stop_loss_pct: 5,
+  telegram_push_interval_hours: 4, // Push status every 4 hours (0 = disabled)
   ticker_blacklist: [],
 };
 
@@ -317,6 +322,7 @@ const DEFAULT_STATE: AgentState = {
   twitterDailyReads: 0,
   twitterDailyReadReset: 0,
   premarketPlan: null,
+  lastTelegramPush: 0,
   enabled: false,
 };
 
@@ -579,6 +585,22 @@ export class MahoragaHarness extends DurableObject<Env> {
         }
       }
 
+      // Periodic Telegram status push
+      const telegramIntervalMs = this.state.config.telegram_push_interval_hours * 3600_000;
+      if (
+        telegramIntervalMs > 0 &&
+        this.env.TELEGRAM_BOT_TOKEN &&
+        this.env.TELEGRAM_CHAT_ID &&
+        now - this.state.lastTelegramPush >= telegramIntervalMs
+      ) {
+        const account = await alpaca.trading.getAccount().catch(() => null);
+        const message = this.formatTelegramStatus(account, positions);
+        const sent = await this.sendTelegramMessage(message);
+        if (sent) {
+          this.state.lastTelegramPush = now;
+        }
+      }
+
       await this.persist();
     } catch (error) {
       this.log("System", "alarm_error", { error: String(error) });
@@ -644,7 +666,7 @@ export class MahoragaHarness extends DurableObject<Env> {
     const url = new URL(request.url);
     const action = url.pathname.slice(1);
 
-    const protectedActions = ["enable", "disable", "config", "trigger", "status", "logs", "costs", "signals", "setup/status"];
+    const protectedActions = ["enable", "disable", "config", "trigger", "status", "logs", "costs", "signals", "setup/status", "telegram/status"];
     if (protectedActions.includes(action)) {
       if (!this.isAuthorized(request)) {
         return this.unauthorizedResponse();
@@ -683,6 +705,12 @@ export class MahoragaHarness extends DurableObject<Env> {
         case "trigger":
           await this.alarm();
           return this.jsonResponse({ ok: true, message: "Alarm triggered" });
+
+        case "telegram/status":
+          return this.handleTelegramStatus(url);
+
+        case "telegram/webhook":
+          return this.handleTelegramWebhook(request);
 
         case "kill":
           if (!this.isKillSwitchAuthorized(request)) {
@@ -2604,6 +2632,270 @@ Response format:
 
   get llm(): LLMProvider | null {
     return this._llm;
+  }
+
+  // ============================================================================
+  // SECTION 11: TELEGRAM INTEGRATION
+  // ============================================================================
+  // Provides real-time portfolio status via Telegram
+  // Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+  // ============================================================================
+
+  private async handleTelegramStatus(url: URL): Promise<Response> {
+    const send = url.searchParams.get("send") !== "false"; // default: send to Telegram
+
+    const alpaca = createAlpacaProviders(this.env);
+    let account: Account | null = null;
+    let positions: Position[] = [];
+
+    try {
+      [account, positions] = await Promise.all([
+        alpaca.trading.getAccount(),
+        alpaca.trading.getPositions(),
+      ]);
+    } catch {
+      // Continue with null values
+    }
+
+    // Format the status message
+    const message = this.formatTelegramStatus(account, positions);
+
+    // Send to Telegram if requested and configured
+    let sent = false;
+    if (send && this.env.TELEGRAM_BOT_TOKEN && this.env.TELEGRAM_CHAT_ID) {
+      sent = await this.sendTelegramMessage(message);
+    }
+
+    return this.jsonResponse({
+      ok: true,
+      sent,
+      message,
+      configured: !!(this.env.TELEGRAM_BOT_TOKEN && this.env.TELEGRAM_CHAT_ID),
+    });
+  }
+
+  private formatTelegramStatus(account: Account | null, positions: Position[]): string {
+    const lines: string[] = [];
+    const now = new Date().toISOString().slice(0, 16).replace("T", " ");
+
+    lines.push(`📊 *MAHORAGA Status* — ${now} UTC`);
+    lines.push("");
+
+    // Account summary
+    if (account) {
+      const pnl = account.equity - account.last_equity;
+      const pnlPct = ((pnl / account.last_equity) * 100).toFixed(2);
+      const pnlEmoji = pnl >= 0 ? "🟢" : "🔴";
+
+      lines.push("💰 *Account*");
+      lines.push(`├ Equity: $${account.equity.toLocaleString("en-US", { minimumFractionDigits: 2 })}`);
+      lines.push(`├ Cash: $${account.cash.toLocaleString("en-US", { minimumFractionDigits: 2 })}`);
+      lines.push(`├ Buying Power: $${account.buying_power.toLocaleString("en-US", { minimumFractionDigits: 2 })}`);
+      lines.push(`└ Day P&L: ${pnlEmoji} $${pnl.toFixed(2)} (${pnl >= 0 ? "+" : ""}${pnlPct}%)`);
+      lines.push("");
+    } else {
+      lines.push("⚠️ Account data unavailable");
+      lines.push("");
+    }
+
+    // Positions
+    if (positions.length > 0) {
+      lines.push(`📈 *Positions* (${positions.length})`);
+      for (const pos of positions.slice(0, 10)) {
+        const plPct = ((pos.unrealized_pl / (pos.market_value - pos.unrealized_pl)) * 100).toFixed(1);
+        const emoji = pos.unrealized_pl >= 0 ? "🟢" : "🔴";
+        lines.push(`├ ${pos.symbol}: ${emoji} $${pos.unrealized_pl.toFixed(2)} (${pos.unrealized_pl >= 0 ? "+" : ""}${plPct}%)`);
+      }
+      if (positions.length > 10) {
+        lines.push(`└ ... and ${positions.length - 10} more`);
+      } else if (lines.length > 0) {
+        // Fix last item to use └
+        const lastLine = lines[lines.length - 1];
+        if (lastLine) {
+          lines[lines.length - 1] = lastLine.replace("├", "└");
+        }
+      }
+      lines.push("");
+    } else {
+      lines.push("📈 *Positions:* None");
+      lines.push("");
+    }
+
+    // LLM Costs
+    const costs = this.state.costTracker;
+    lines.push("🤖 *LLM Costs*");
+    lines.push(`└ Total: $${costs.total_usd.toFixed(4)}`);
+    lines.push("");
+
+    // Recent trades (from logs)
+    const tradeLogs = this.state.logs
+      .filter(l => l.action === "buy_executed" || l.action === "sell_executed")
+      .slice(-30);
+
+    if (tradeLogs.length > 0) {
+      lines.push(`📜 *Recent Trades* (${tradeLogs.length})`);
+      for (const trade of tradeLogs.slice(-5).reverse()) {
+        const emoji = trade.action === "buy_executed" ? "🟢 BUY" : "🔴 SELL";
+        const time = new Date(trade.timestamp).toISOString().slice(11, 16);
+        lines.push(`├ ${time} ${emoji} ${trade.symbol || "?"}`);
+      }
+      if (tradeLogs.length > 5) {
+        lines.push(`└ ... and ${tradeLogs.length - 5} more`);
+      }
+    } else {
+      lines.push("📜 *Recent Trades:* None");
+    }
+
+    lines.push("");
+    lines.push(`_Agent: ${this.state.enabled ? "✅ Enabled" : "⏸️ Disabled"}_`);
+
+    return lines.join("\n");
+  }
+
+  private async sendTelegramMessage(text: string): Promise<boolean> {
+    if (!this.env.TELEGRAM_BOT_TOKEN || !this.env.TELEGRAM_CHAT_ID) {
+      return false;
+    }
+
+    try {
+      const response = await fetch(
+        `https://api.telegram.org/bot${this.env.TELEGRAM_BOT_TOKEN}/sendMessage`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chat_id: this.env.TELEGRAM_CHAT_ID,
+            text,
+            parse_mode: "Markdown",
+            disable_web_page_preview: true,
+          }),
+        }
+      );
+
+      if (!response.ok) {
+        const error = await response.text();
+        this.log("Telegram", "send_failed", { error });
+        return false;
+      }
+
+      this.log("Telegram", "message_sent", {});
+      return true;
+    } catch (error) {
+      this.log("Telegram", "send_error", { error: String(error) });
+      return false;
+    }
+  }
+
+  private async handleTelegramWebhook(request: Request): Promise<Response> {
+    // Telegram sends POST with update object
+    if (request.method !== "POST") {
+      return new Response("Method not allowed", { status: 405 });
+    }
+
+    try {
+      const update = await request.json() as {
+        message?: {
+          chat: { id: number };
+          text?: string;
+          from?: { id: number; username?: string };
+        };
+      };
+
+      const message = update.message;
+      if (!message?.text) {
+        return new Response("OK"); // Ignore non-text messages
+      }
+
+      // Security: Only respond to authorized chat
+      const authorizedChatId = this.env.TELEGRAM_CHAT_ID;
+      if (authorizedChatId && String(message.chat.id) !== authorizedChatId) {
+        this.log("Telegram", "unauthorized_chat", { chat_id: message.chat.id });
+        return new Response("OK");
+      }
+
+      const text = message.text.trim().toLowerCase();
+      const command = text.split(" ")[0];
+
+      let response: string;
+
+      switch (command) {
+        case "/status":
+        case "/s": {
+          const alpaca = createAlpacaProviders(this.env);
+          const [account, positions] = await Promise.all([
+            alpaca.trading.getAccount().catch(() => null),
+            alpaca.trading.getPositions().catch(() => [] as Position[]),
+          ]);
+          response = this.formatTelegramStatus(account, positions);
+          break;
+        }
+
+        case "/enable":
+        case "/start": {
+          this.state.enabled = true;
+          await this.scheduleNextAlarm();
+          await this.persist();
+          response = "✅ Agent *enabled*. Trading is now active.";
+          break;
+        }
+
+        case "/disable":
+        case "/pause":
+        case "/stop": {
+          this.state.enabled = false;
+          await this.persist();
+          response = "⏸️ Agent *disabled*. Trading paused.";
+          break;
+        }
+
+        case "/positions":
+        case "/p": {
+          const alpaca = createAlpacaProviders(this.env);
+          const positions = await alpaca.trading.getPositions().catch(() => [] as Position[]);
+          if (positions.length === 0) {
+            response = "📈 *No open positions*";
+          } else {
+            const lines = ["📈 *Positions*", ""];
+            for (const pos of positions) {
+              const emoji = pos.unrealized_pl >= 0 ? "🟢" : "🔴";
+              const plPct = ((pos.unrealized_pl / (pos.market_value - pos.unrealized_pl)) * 100).toFixed(1);
+              lines.push(`${emoji} *${pos.symbol}*: $${pos.unrealized_pl.toFixed(2)} (${pos.unrealized_pl >= 0 ? "+" : ""}${plPct}%)`);
+            }
+            response = lines.join("\n");
+          }
+          break;
+        }
+
+        case "/costs":
+        case "/c": {
+          const costs = this.state.costTracker;
+          response = `🤖 *LLM Costs*\nTotal: $${costs.total_usd.toFixed(4)}`;
+          break;
+        }
+
+        case "/help":
+        case "/h":
+        default: {
+          response = `🤖 *MAHORAGA Bot Commands*
+
+/status, /s — Portfolio status
+/positions, /p — Open positions
+/costs, /c — LLM spending
+/enable, /start — Enable trading
+/disable, /pause — Pause trading
+/help, /h — Show this menu`;
+          break;
+        }
+      }
+
+      // Send response
+      await this.sendTelegramMessage(response);
+      return new Response("OK");
+
+    } catch (error) {
+      this.log("Telegram", "webhook_error", { error: String(error) });
+      return new Response("OK"); // Always return OK to Telegram
+    }
   }
 
   private discordCooldowns: Map<string, number> = new Map();

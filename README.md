@@ -84,6 +84,10 @@ npx wrangler secret put ALPACA_PAPER         # "true" for paper trading (recomme
 npx wrangler secret put TWITTER_BEARER_TOKEN
 npx wrangler secret put DISCORD_WEBHOOK_URL
 npx wrangler secret put KILL_SWITCH_SECRET   # Emergency kill switch (separate from API token)
+
+# Telegram notifications (get from @BotFather and @userinfobot)
+npx wrangler secret put TELEGRAM_BOT_TOKEN   # From @BotFather
+npx wrangler secret put TELEGRAM_CHAT_ID     # Your chat ID from @userinfobot
 ```
 
 ### 4. Deploy
