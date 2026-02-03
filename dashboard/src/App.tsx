@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { motion, AnimatePresence } from 'motion/react'
 import clsx from 'clsx'
 import { Panel } from './components/Panel'
@@ -131,7 +131,6 @@ export default function App() {
   const [setupChecked, setSetupChecked] = useState(false)
   const [time, setTime] = useState(new Date())
   const [portfolioHistory, setPortfolioHistory] = useState<PortfolioSnapshot[]>([])
-  const logsEndRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     const checkSetup = async () => {
@@ -195,10 +194,6 @@ export default function App() {
       }
     }
   }, [setupChecked, showSetup])
-
-  useEffect(() => {
-    logsEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [status?.logs])
 
   const handleSaveConfig = async (config: Config) => {
     const res = await authFetch(`${API_BASE}/config`, {
@@ -627,7 +622,7 @@ export default function App() {
                 {logs.length === 0 ? (
                   <div className="text-hud-text-dim py-4 text-center">Waiting for activity...</div>
                 ) : (
-                  logs.slice(-50).map((log: LogEntry, i: number) => (
+                  logs.slice(-50).reverse().map((log: LogEntry, i: number) => (
                     <motion.div 
                       key={`${log.timestamp}-${i}`}
                       initial={{ opacity: 0 }}
@@ -647,7 +642,7 @@ export default function App() {
                     </motion.div>
                   ))
                 )}
-                <div ref={logsEndRef} />
+
               </div>
             </Panel>
           </div>
@@ -658,7 +653,9 @@ export default function App() {
                 {Object.entries(status?.signalResearch || {}).length === 0 ? (
                   <div className="text-hud-text-dim text-sm py-4 text-center">Researching candidates...</div>
                 ) : (
-                  Object.entries(status?.signalResearch || {}).map(([symbol, research]: [string, SignalResearch]) => (
+                  Object.entries(status?.signalResearch || {})
+                    .sort(([, a], [, b]) => b.timestamp - a.timestamp)
+                    .map(([symbol, research]: [string, SignalResearch]) => (
                     <Tooltip
                       key={symbol}
                       position="left"
