@@ -92,6 +92,16 @@ curl -H "Authorization: Bearer $MAHORAGA_TOKEN" \
   https://your-worker.workers.dev/agent/enable
 ```
 
+**Git Bash users (Windows):** Load your token from `.env` file:
+```bash
+# Load token from .env file
+source .env
+
+# Now use the token
+curl -H "Authorization: Bearer $MAHORAGA_API_TOKEN" \
+  https://your-worker.workers.dev/agent/enable
+```
+
 ### 6. Monitor
 
 ```bash
@@ -111,6 +121,22 @@ curl -H "Authorization: Bearer $KILL_SWITCH_SECRET" \
 cd dashboard && npm install && npm run dev
 ```
 
+### 7. Pause / Resume
+
+```bash
+# Pause the agent (soft disable - keeps state)
+curl -H "Authorization: Bearer $MAHORAGA_TOKEN" \
+  https://your-worker.workers.dev/agent/disable
+
+# Resume the agent
+curl -H "Authorization: Bearer $MAHORAGA_TOKEN" \
+  https://your-worker.workers.dev/agent/enable
+
+# Emergency kill (disables + clears alarms + clears signal cache)
+curl -H "Authorization: Bearer $KILL_SWITCH_SECRET" \
+  https://your-worker.workers.dev/agent/kill
+```
+
 ## Local Development
 
 ```bash
@@ -120,8 +146,9 @@ npx wrangler dev
 # Terminal 2 - Start dashboard  
 cd dashboard && npm run dev
 
-# Terminal 3 - Enable the agent
-curl -H "Authorization: Bearer $MAHORAGA_TOKEN" \
+# Terminal 3 - Enable the agent (Git Bash)
+source .env
+curl -H "Authorization: Bearer $MAHORAGA_API_TOKEN" \
   http://localhost:8787/agent/enable
 ```
 
