@@ -60,6 +60,9 @@
 			"bucket_name": "mahoraga-artifacts"
 		}
 	],
+	"ai": {
+		"binding": "AI"
+	},
 	"durable_objects": {
 		"bindings": [
 			{

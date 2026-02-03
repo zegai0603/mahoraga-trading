@@ -144,6 +144,9 @@ interface PositionEntry {
   entry_reason: string;
   peak_price: number;
   peak_sentiment: number;
+  // Trailing stop fields
+  highest_price: number;       // Track peak price for trailing stop
+  trailing_stop_pct: number;   // Dynamic trailing stop % (based on ATR)
 }
 
 interface SocialHistoryEntry {
@@ -440,8 +443,9 @@ function extractTickers(text: string, customBlacklist: string[] = []): string[] 
  * [CUSTOMIZABLE] Sentiment detection - keyword-based bullish/bearish scoring
  * Add/remove words to match your trading style
  * Returns -1 (bearish) to +1 (bullish)
+ * NOTE: This is the FALLBACK when AI embeddings are unavailable
  */
-function detectSentiment(text: string): number {
+function detectSentimentKeywords(text: string): number {
   const lower = text.toLowerCase();
   const bullish = ["moon", "rocket", "buy", "calls", "long", "bullish", "yolo", "tendies", "gains", "diamond", "squeeze", "pump", "green", "up", "breakout", "undervalued", "accumulate"];
   const bearish = ["puts", "short", "sell", "bearish", "crash", "dump", "drill", "tank", "rip", "red", "down", "bag", "overvalued", "bubble", "avoid"];
@@ -453,6 +457,60 @@ function detectSentiment(text: string): number {
   const total = bull + bear;
   if (total === 0) return 0;
   return (bull - bear) / total;
+}
+
+// Anchor phrases for semantic sentiment comparison
+const BULLISH_ANCHOR = "This stock will go up significantly. Strong buy signal, positive outlook, great opportunity, bullish momentum.";
+const BEARISH_ANCHOR = "This stock will crash. Sell immediately, negative outlook, avoid this, bearish momentum, major risk.";
+
+/**
+ * Cosine similarity between two vectors
+ */
+function cosineSimilarity(a: number[], b: number[]): number {
+  let dotProduct = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dotProduct += a[i]! * b[i]!;
+    normA += a[i]! * a[i]!;
+    normB += b[i]! * b[i]!;
+  }
+  if (normA === 0 || normB === 0) return 0;
+  return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
+/**
+ * Semantic sentiment using Cloudflare AI embeddings
+ * Compares text to bullish/bearish anchor phrases using cosine similarity
+ * Returns -1 (bearish) to +1 (bullish)
+ * Falls back to keyword detection if AI unavailable
+ */
+async function detectSentimentSemantic(text: string, ai: Ai | undefined): Promise<number> {
+  if (!ai) {
+    return detectSentimentKeywords(text);
+  }
+
+  try {
+    // Truncate text to avoid token limits
+    const truncated = text.slice(0, 500);
+
+    const result = await ai.run("@cf/baai/bge-base-en-v1.5", {
+      text: [truncated, BULLISH_ANCHOR, BEARISH_ANCHOR]
+    }) as { data: number[][] };
+
+    const textEmbed = result.data[0]!;
+    const bullEmbed = result.data[1]!;
+    const bearEmbed = result.data[2]!;
+
+    const bullSim = cosineSimilarity(textEmbed, bullEmbed);
+    const bearSim = cosineSimilarity(textEmbed, bearEmbed);
+
+    // Normalize to -1 to +1 range
+    return Math.max(-1, Math.min(1, (bullSim - bearSim) * 2));
+  } catch {
+    // Fallback to keywords on error
+    return detectSentimentKeywords(text);
+  }
 }
 
 // ============================================================================
@@ -610,7 +668,32 @@ export class MahoragaHarness extends DurableObject<Env> {
   }
 
   private async scheduleNextAlarm(): Promise<void> {
-    const nextRun = Date.now() + 30_000;  // 30 seconds
+    // Smart polling: adjust interval based on market status
+    const now = new Date();
+    const hour = now.getUTCHours();
+    const dayOfWeek = now.getUTCDay(); // 0 = Sunday, 6 = Saturday
+
+    // Market hours: 9:30 AM - 4:00 PM ET = 14:30 - 21:00 UTC (roughly)
+    // Pre-market: 4:00 AM - 9:30 AM ET = 9:00 - 14:30 UTC
+    // After hours: 4:00 PM - 8:00 PM ET = 21:00 - 1:00 UTC
+
+    let intervalMs: number;
+
+    if (dayOfWeek === 0 || dayOfWeek === 6) {
+      // Weekend - poll every 10 minutes (crypto only if enabled)
+      intervalMs = this.state.config.crypto_enabled ? 300_000 : 600_000;
+    } else if (hour >= 14 && hour < 21) {
+      // Market hours (approx) - poll every 30 seconds
+      intervalMs = 30_000;
+    } else if (hour >= 13 && hour < 14) {
+      // Pre-market (last hour before open) - poll every 60 seconds
+      intervalMs = 60_000;
+    } else {
+      // After hours / overnight - poll every 5 minutes
+      intervalMs = this.state.config.crypto_enabled ? 120_000 : 300_000;
+    }
+
+    const nextRun = Date.now() + intervalMs;
     await this.ctx.storage.setAlarm(nextRun);
   }
 
@@ -842,13 +925,15 @@ export class MahoragaHarness extends DurableObject<Env> {
   private async runDataGatherers(): Promise<void> {
     this.log("System", "gathering_data", {});
 
-    const [stocktwitsSignals, redditSignals, cryptoSignals] = await Promise.all([
+    const [stocktwitsSignals, redditSignals, cryptoSignals, secSignals, yahooSignals] = await Promise.all([
       this.gatherStockTwits(),
       this.gatherReddit(),
       this.gatherCrypto(),
+      this.gatherSECFilings(),
+      this.gatherYahooNews(),
     ]);
 
-    const allSignals = [...stocktwitsSignals, ...redditSignals, ...cryptoSignals];
+    const allSignals = [...stocktwitsSignals, ...redditSignals, ...cryptoSignals, ...secSignals, ...yahooSignals];
 
     const MAX_SIGNALS = 200;
     const MAX_AGE_MS = 24 * 60 * 60 * 1000;
@@ -865,6 +950,8 @@ export class MahoragaHarness extends DurableObject<Env> {
       stocktwits: stocktwitsSignals.length,
       reddit: redditSignals.length,
       crypto: cryptoSignals.length,
+      sec: secSignals.length,
+      yahoo: yahooSignals.length,
       total: this.state.signalCache.length,
     });
   }
@@ -965,7 +1052,7 @@ export class MahoragaHarness extends DurableObject<Env> {
         for (const post of posts) {
           const text = `${post.title || ""} ${post.selftext || ""}`;
           const tickers = extractTickers(text, this.state.config.ticker_blacklist);
-          const rawSentiment = detectSentiment(text);
+          const rawSentiment = detectSentimentKeywords(text);
 
           const timeDecay = calculateTimeDecay(post.created_utc || Date.now() / 1000);
           const engagementMult = getEngagementMultiplier(post.ups || 0, post.num_comments || 0);
@@ -1095,6 +1182,175 @@ export class MahoragaHarness extends DurableObject<Env> {
     }
 
     this.log("Crypto", "gathered_signals", { count: signals.length });
+    return signals;
+  }
+
+  /**
+   * Gather SEC EDGAR 8-K filings (material events: earnings, M&A, guidance)
+   * FREE source - uses SEC EDGAR JSON API
+   */
+  private async gatherSECFilings(): Promise<Signal[]> {
+    const signals: Signal[] = [];
+    // Use SEC's newer JSON endpoint which is more reliable
+    const SEC_API_URL = "https://efts.sec.gov/LATEST/search-index?q=8-K&dateRange=custom&startdt=2024-01-01&forms=8-K&size=20";
+
+    try {
+      const res = await fetch(SEC_API_URL, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+          "Accept": "application/json",
+        },
+      });
+
+      if (!res.ok) {
+        // Fallback: try the RSS feed with different user agent
+        const rssRes = await fetch("https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&count=20&output=atom", {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (compatible; research bot)",
+            "Accept": "application/atom+xml",
+          },
+        });
+
+        if (!rssRes.ok) {
+          this.log("SEC", "error", { message: `Both SEC endpoints failed: ${res.status}, ${rssRes.status}` });
+          return signals;
+        }
+
+        const text = await rssRes.text();
+        const entryRegex = /<entry>([\s\S]*?)<\/entry>/g;
+        const titleRegex = /<title[^>]*>([\s\S]*?)<\/title>/;
+
+        let match;
+        while ((match = entryRegex.exec(text)) !== null) {
+          const entry = match[1]!;
+          const titleMatch = entry.match(titleRegex);
+          if (!titleMatch) continue;
+
+          const title = titleMatch[1]!.replace(/<!\[CDATA\[|\]\]>/g, "").trim();
+
+          // More flexible ticker extraction
+          const tickerPatterns = [
+            /8-K\s*-\s*([A-Z]{1,5})\s/,           // "8-K - AAPL ..."
+            /\(([A-Z]{1,5})\)\s*8-K/,              // "(AAPL) 8-K"
+            /^([A-Z]{1,5})\s*-\s*8-K/,             // "AAPL - 8-K"
+            /Form 8-K.*?([A-Z]{2,5})\s/i,          // "Form 8-K ... AAPL"
+          ];
+
+          let symbol: string | null = null;
+          for (const pattern of tickerPatterns) {
+            const tickerMatch = title.match(pattern);
+            if (tickerMatch) {
+              symbol = tickerMatch[1]!;
+              break;
+            }
+          }
+
+          if (!symbol) continue;
+          if (this.state.config.ticker_blacklist.includes(symbol)) continue;
+
+          signals.push({
+            symbol,
+            source: "sec",
+            source_detail: "sec_8k",
+            sentiment: 0.15, // Neutral-positive (filing activity = attention)
+            raw_sentiment: 0,
+            volume: 1,
+            freshness: 1.0,
+            source_weight: 0.9,
+            reason: `SEC 8-K: ${title.slice(0, 60)}`,
+            timestamp: Date.now(),
+          });
+        }
+      }
+
+      this.log("SEC", "gathered_signals", { count: signals.length });
+    } catch (error) {
+      this.log("SEC", "error", { message: String(error) });
+    }
+
+    return signals;
+  }
+
+  /**
+   * Gather Yahoo Finance RSS news
+   * FREE source - parses RSS feed for market news
+   */
+  private async gatherYahooNews(): Promise<Signal[]> {
+    const signals: Signal[] = [];
+    const YAHOO_RSS_URL = "https://feeds.finance.yahoo.com/rss/2.0/headline?s=^GSPC,^DJI&region=US&lang=en-US";
+
+    try {
+      const res = await fetch(YAHOO_RSS_URL, {
+        headers: { "User-Agent": "Mahoraga/2.0" },
+      });
+      if (!res.ok) return signals;
+
+      const text = await res.text();
+
+      // Parse RSS items
+      const itemRegex = /<item>([\s\S]*?)<\/item>/g;
+      const titleRegex = /<title>([\s\S]*?)<\/title>/;
+      const descRegex = /<description>([\s\S]*?)<\/description>/;
+      const pubDateRegex = /<pubDate>([\s\S]*?)<\/pubDate>/;
+
+      const tickerData = new Map<string, { mentions: number; sentiment: number; headlines: string[] }>();
+
+      let match;
+      while ((match = itemRegex.exec(text)) !== null) {
+        const item = match[1]!;
+        const titleMatch = item.match(titleRegex);
+        const descMatch = item.match(descRegex);
+        const pubDateMatch = item.match(pubDateRegex);
+
+        if (!titleMatch) continue;
+
+        const title = titleMatch[1]!.replace(/<!\[CDATA\[|\]\]>/g, "").trim();
+        const desc = descMatch ? descMatch[1]!.replace(/<!\[CDATA\[|\]\]>/g, "").trim() : "";
+        const pubDate = pubDateMatch ? new Date(pubDateMatch[1]!).getTime() : Date.now();
+
+        // Skip old news (> 6 hours)
+        if (Date.now() - pubDate > 6 * 60 * 60 * 1000) continue;
+
+        const fullText = `${title} ${desc}`;
+        const tickers = extractTickers(fullText, this.state.config.ticker_blacklist);
+
+        if (tickers.length === 0) continue;
+
+        const sentiment = await detectSentimentSemantic(fullText, this.env.AI);
+
+        for (const ticker of tickers) {
+          if (!tickerData.has(ticker)) {
+            tickerData.set(ticker, { mentions: 0, sentiment: 0, headlines: [] });
+          }
+          const d = tickerData.get(ticker)!;
+          d.mentions++;
+          d.sentiment += sentiment;
+          if (d.headlines.length < 3) d.headlines.push(title.slice(0, 60));
+        }
+      }
+
+      for (const [symbol, data] of tickerData) {
+        const avgSentiment = data.sentiment / data.mentions;
+
+        signals.push({
+          symbol,
+          source: "yahoo",
+          source_detail: "yahoo_finance",
+          sentiment: avgSentiment,
+          raw_sentiment: avgSentiment,
+          volume: data.mentions,
+          freshness: 1.0,
+          source_weight: 0.75, // Medium trust - news aggregator
+          reason: `Yahoo: ${data.mentions} headlines - "${data.headlines[0] || ''}"`,
+          timestamp: Date.now(),
+        });
+      }
+
+      this.log("Yahoo", "gathered_signals", { count: signals.length });
+    } catch (error) {
+      this.log("Yahoo", "error", { message: String(error) });
+    }
+
     return signals;
   }
 
@@ -1949,6 +2205,26 @@ Response format:
         continue;
       }
 
+      // Trailing stop check - update highest price and check for trigger
+      const entry = this.state.positionEntries[pos.symbol];
+      if (entry) {
+        // Update highest price tracking
+        if (pos.current_price > entry.highest_price) {
+          entry.highest_price = pos.current_price;
+        }
+
+        // Check trailing stop trigger
+        if (entry.highest_price > 0 && entry.trailing_stop_pct > 0) {
+          const trailingStopPrice = entry.highest_price * (1 - entry.trailing_stop_pct / 100);
+          if (pos.current_price <= trailingStopPrice && plPct > 0) {
+            // Only trigger trailing stop if we're still in profit (lock in gains)
+            await this.executeSell(alpaca, pos.symbol,
+              `Trailing stop: price ${pos.current_price.toFixed(2)} fell ${entry.trailing_stop_pct}% below peak ${entry.highest_price.toFixed(2)}`);
+            continue;
+          }
+        }
+      }
+
       // Check staleness
       if (this.state.config.stale_position_enabled) {
         const stalenessResult = this.analyzeStaleness(pos.symbol, pos.current_price, 0);
@@ -2012,6 +2288,8 @@ Response format:
             entry_reason: research.reasoning,
             peak_price: 0,
             peak_sentiment: originalSignal?.sentiment || finalConfidence,
+            highest_price: 0,
+            trailing_stop_pct: 8, // Default 8%, will be ATR-adjusted
           };
         }
       }
@@ -2050,6 +2328,8 @@ Response format:
               entry_reason: rec.reasoning,
               peak_price: 0,
               peak_sentiment: originalSignal?.sentiment || rec.confidence,
+              highest_price: 0,
+              trailing_stop_pct: 8,
             };
           }
         }
@@ -2566,6 +2846,8 @@ Response format:
             entry_reason: rec.reasoning,
             peak_price: 0,
             peak_sentiment: originalSignal?.sentiment || 0,
+            highest_price: 0,
+            trailing_stop_pct: 8,
           };
         }
       }

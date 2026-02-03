@@ -4,6 +4,7 @@ export interface Env {
   ARTIFACTS: R2Bucket;
   SESSION: DurableObjectNamespace;
   MAHORAGA_HARNESS?: DurableObjectNamespace;
+  AI?: Ai;  // Cloudflare Workers AI for embeddings
 
   ALPACA_API_KEY: string;
   ALPACA_API_SECRET: string;
