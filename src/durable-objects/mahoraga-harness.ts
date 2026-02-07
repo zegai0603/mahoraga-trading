@@ -1819,8 +1819,15 @@ JSON response:
         const snapshot = await alpaca.marketData.getCryptoSnapshot(normalized).catch(() => null);
         price = snapshot?.latest_quote?.ask_price || snapshot?.latest_quote?.bid_price || snapshot?.latest_trade?.price || 0;
       } else {
-        const quote = await alpaca.marketData.getQuote(symbol).catch(() => null);
-        price = quote?.ask_price || quote?.bid_price || 0;
+        // Use getSnapshot first (includes latest trade price), fallback to getQuote
+        // This fixes $0 prices when quote data isn't available (e.g., market closed, subscription limits)
+        const snapshot = await alpaca.marketData.getSnapshot(symbol).catch(() => null);
+        price = snapshot?.latest_trade?.price || snapshot?.daily_bar?.c || 0;
+
+        if (price === 0) {
+          const quote = await alpaca.marketData.getQuote(symbol).catch(() => null);
+          price = quote?.ask_price || quote?.bid_price || 0;
+        }
       }
 
       const prompt = `Should we BUY this ${isCrypto ? "crypto" : "stock"} based on social sentiment and fundamentals?
